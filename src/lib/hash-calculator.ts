@@ -38,7 +38,7 @@ import { eq, and, count, gt, isNull, inArray, sql } from 'drizzle-orm';
 
 import { createFileStream, type FileEntry } from '@lib/file-reader.ts';
 import { pausable } from '@lib/pausable.ts';
-import { createXXHash64 } from 'hash-wasm';
+import { createXXHash64, type IHasher } from 'hash-wasm';
 import type { Readable } from 'node:stream';
 
 // Hash calculation configuration
@@ -96,8 +96,7 @@ export const DEFAULT_HASH_CONFIG: Required<
  * Note: seed 0 yields the STANDARD XXH64 value (portable across tools/machines), unlike
  * the previous `Bun.hash(buffer, 'xxhash64')` which silently computed one-shot wyhash.
  */
-async function hashStream(stream: Readable): Promise<string> {
-  const hasher = await createXXHash64();
+async function hashStream(hasher: IHasher, stream: Readable): Promise<string> {
   hasher.init();
   try {
     for await (const chunk of stream) {
@@ -111,6 +110,11 @@ async function hashStream(stream: Readable): Promise<string> {
   }
   return hasher.digest('hex'); // 16-char hex, matches the DB `hash` column
 }
+
+/** Hashers free for reuse. Creating one costs ~1 ms, which dominated hashing small files;
+ *  a hasher is only returned here once its file is done, so concurrent files never share
+ *  one, and the pool never grows past the hashing concurrency. */
+const idleHashers: IHasher[] = [];
 
 /**
  * Hash a single file with archive-aware processing and cross-platform path handling
@@ -136,13 +140,20 @@ function hashSingleFile(rootPath: string, fileEntry: FileHashEntry): Observable<
       // Stream the bytes through the hasher — never materialise the whole file.
       // createFileStream gives a native fs stream for regular files (the OOM path)
       // and a bounded, already-extracted buffer stream for archive entries.
-      const stream = await createFileStream(rootPath, entry);
-      const hash = await hashStream(stream);
+      // The hasher is taken BEFORE the stream is opened: awaiting it in between let an
+      // open error (ENOENT) fire with no listener attached, as an uncaught exception.
+      const hasher = idleHashers.pop() ?? (await createXXHash64());
+      try {
+        const stream = await createFileStream(rootPath, entry);
+        const hash = await hashStream(hasher, stream);
 
-      return {
-        path: fileEntry.path,
-        hash,
-      };
+        return {
+          path: fileEntry.path,
+          hash,
+        };
+      } finally {
+        idleHashers.push(hasher);
+      }
     } catch (error) {
       logger.warn('Hash calculation failed', {
         path: fileEntry.path,
@@ -269,6 +280,10 @@ function analyzeFiles(connection: DatabaseConnection): Observable<void> {
 
 /**
  * Update hash batch in database
+ *
+ * One UPDATE ... FROM (VALUES ...) per batch instead of one UPDATE per file: a statement
+ * round-trip costs ~1 ms in PGlite, as much as hashing a small file. Atomic per batch, as
+ * before (a failed statement already aborted the enclosing transaction).
  */
 function updateHashBatch(
   connection: DatabaseConnection,
@@ -278,26 +293,18 @@ function updateHashBatch(
   if (!updates.length) return of(0);
 
   return defer(() => {
+    const values = sql.join(
+      updates.map(u => sql`(${u.path}, ${u.hash})`),
+      sql`, `
+    );
     return from(
-      connection.db.transaction(async tx => {
-        let updated = 0;
-        for (const update of updates) {
-          try {
-            await tx
-              .update(files)
-              .set({ hash: update.hash })
-              .where(and(eq(files.run_id, runId), eq(files.path, update.path)));
-            updated++;
-          } catch (error) {
-            logger.warn('Failed to update hash for file', {
-              path: update.path,
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        }
-        return updated;
-      })
+      connection.db.execute(sql`
+        UPDATE files SET hash = v.hash
+        FROM (VALUES ${values}) AS v(path, hash)
+        WHERE files.run_id = ${runId} AND files.path = v.path
+      `)
     ).pipe(
+      map(() => updates.length),
       catchError(error => {
         logger.error('Hash batch update failed', error as Error, {
           runId,
