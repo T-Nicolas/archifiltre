@@ -32,9 +32,9 @@ import {
 } from 'rxjs/operators';
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
-import { findDuplicateSizes, files } from '@lib/database.ts';
+import { duplicateSizesSubquery, hasDuplicateContentSize, files } from '@lib/database.ts';
 import type { PipelineContext } from '@lib/pipeline-context.ts';
-import { eq, and, count, isNull, inArray, sql } from 'drizzle-orm';
+import { eq, and, count, gt, isNull, inArray, sql } from 'drizzle-orm';
 
 import { createFileStream, type FileEntry } from '@lib/file-reader.ts';
 import { pausable } from '@lib/pausable.ts';
@@ -167,16 +167,18 @@ function hashSingleFile(rootPath: string, fileEntry: FileHashEntry): Observable<
  * Get a batch of files that need hashing using streaming SQL
  * This avoids loading all file paths into memory
  * Now includes archive metadata for archive-aware processing
+ *
+ * Keyset-paginated on path (after `afterPath`), not OFFSET: hashed rows leave the
+ * `hash IS NULL` set between batches, so an advancing offset would skip unhashed files.
+ * Walks the primary key in path order with a per-row EXISTS, so each page costs O(page),
+ * not a re-aggregation of the whole run.
  */
 function getFilesBatch(
   connection: DatabaseConnection,
   runId: string,
-  duplicateSizes: number[],
-  offset: number,
+  afterPath: string | null,
   batchSize: number
 ): Observable<FileHashEntry[]> {
-  if (!duplicateSizes.length) return of([]);
-
   return defer(() => {
     return from(
       connection.db
@@ -190,11 +192,12 @@ function getFilesBatch(
           and(
             eq(files.run_id, runId),
             isNull(files.hash), // Only files that don't have hash yet
-            inArray(files.content_size, duplicateSizes) // Only files with duplicate content_size
+            hasDuplicateContentSize(connection), // Only files with duplicate content_size
+            afterPath === null ? undefined : gt(files.path, afterPath)
           )
         )
+        .orderBy(files.path)
         .limit(batchSize)
-        .offset(offset)
     ).pipe(
       map(results =>
         results.map(r => ({
@@ -206,7 +209,7 @@ function getFilesBatch(
       catchError(error => {
         logger.error('Failed to get files batch', error as Error, {
           runId,
-          offset,
+          afterPath,
           batchSize,
         });
         return of([]);
@@ -220,11 +223,8 @@ function getFilesBatch(
  */
 function getTotalFilesNeedingHash(
   connection: DatabaseConnection,
-  runId: string,
-  duplicateSizes: number[]
+  runId: string
 ): Observable<number> {
-  if (!duplicateSizes.length) return of(0);
-
   return defer(() => {
     return from(
       connection.db
@@ -234,7 +234,7 @@ function getTotalFilesNeedingHash(
           and(
             eq(files.run_id, runId),
             isNull(files.hash),
-            inArray(files.content_size, duplicateSizes)
+            inArray(files.content_size, duplicateSizesSubquery(connection, runId))
           )
         )
     ).pipe(
@@ -247,6 +247,24 @@ function getTotalFilesNeedingHash(
       })
     );
   });
+}
+
+/**
+ * Refresh planner statistics for `files` before the hashing queries. PGlite runs Postgres
+ * without autovacuum, so a freshly ingested run still looks empty to the planner, which then
+ * nested-loops the duplicate-size subquery (minutes on ~100k rows, unbounded at millions).
+ * Best-effort: a failure only costs speed.
+ */
+function analyzeFiles(connection: DatabaseConnection): Observable<void> {
+  return defer(() => from(connection.db.execute(sql`ANALYZE files`))).pipe(
+    map(() => void 0),
+    catchError(error => {
+      logger.warn('ANALYZE files failed, hashing queries may be slow', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return of(void 0);
+    })
+  );
 }
 
 /**
@@ -373,109 +391,90 @@ export function calculateHashes(
 
   logger.debug('Starting hash calculation', { runId, rootPath });
 
-  return findDuplicateSizes(connection, runId).pipe(
-    tap(duplicateSizes => {
-      if (!duplicateSizes.length) {
-        logger.debug('No files need hashing - no duplicate content sizes found', {
-          runId,
-        });
-      } else {
-        logger.debug('Found content sizes with potential duplicates', {
-          runId,
-          duplicateSizeCount: duplicateSizes.length,
-        });
-      }
+  // Get total count for progress reporting (0 also covers "no duplicate content sizes")
+  return analyzeFiles(connection).pipe(
+    switchMap(() => getTotalFilesNeedingHash(connection, runId)),
+    tap(total => {
+      stats.totalFiles = total;
+      logger.debug('Total files needing hash calculation', {
+        runId,
+        totalFiles: total,
+      });
     }),
-    switchMap(duplicateSizes => {
-      if (!duplicateSizes.length) {
+    switchMap(totalFiles => {
+      if (totalFiles === 0) {
+        logger.debug('No files need hashing', { runId });
         return of(void 0);
       }
 
-      // Get total count for progress reporting
-      return getTotalFilesNeedingHash(connection, runId, duplicateSizes).pipe(
-        tap(total => {
-          stats.totalFiles = total;
-          logger.debug('Total files needing hash calculation', {
-            runId,
-            totalFiles: total,
-          });
-        }),
-        switchMap(totalFiles => {
-          if (totalFiles === 0) {
-            logger.debug('All duplicate files already have hashes', { runId });
-            return of(void 0);
-          }
+      // Process files in streaming batches. The candidate set is fixed for this run, so
+      // ceil(total / batchSize) keyset pages cover it exactly, failed files included.
+      let lastPath: string | null = null;
 
-          // Process files in streaming batches
-          let currentOffset = 0;
+      return range(0, Math.ceil(totalFiles / finalConfig.batchSize)).pipe(
+        pausable({ pauseSignal: finalConfig.pauseSignal, resumeSignal: finalConfig.resumeSignal }),
+        concatMap(() => {
+          const afterPath = lastPath;
 
-          return range(0, Math.ceil(totalFiles / finalConfig.batchSize)).pipe(
-            pausable({ pauseSignal: finalConfig.pauseSignal, resumeSignal: finalConfig.resumeSignal }),
-            concatMap(() => {
-              const offset = currentOffset;
-              currentOffset += finalConfig.batchSize;
+          return getFilesBatch(connection, runId, afterPath, finalConfig.batchSize).pipe(
+            switchMap(fileEntries => {
+              if (!fileEntries.length) {
+                return of(0); // No more files to process
+              }
+              // Advance past the whole page, hashed or not: a file that failed to hash stays
+              // NULL and must not be fetched again.
+              lastPath = fileEntries[fileEntries.length - 1].path;
 
-              return getFilesBatch(
+              logger.debug('Processing hash batch', {
+                runId,
+                afterPath,
+                batchSize: fileEntries.length,
+              });
+
+              return processBatch(
                 connection,
                 runId,
-                duplicateSizes,
-                offset,
-                finalConfig.batchSize
+                rootPath,
+                fileEntries,
+                finalConfig.concurrency
               ).pipe(
-                switchMap(fileEntries => {
-                  if (!fileEntries.length) {
-                    return of(0); // No more files to process
+                tap(processed => {
+                  stats.processed += processed;
+
+                  if (finalConfig.onProgress) {
+                    finalConfig.onProgress(stats.processed, stats.totalFiles, stats.errors);
                   }
-
-                  logger.debug('Processing hash batch', {
-                    runId,
-                    offset,
-                    batchSize: fileEntries.length,
-                  });
-
-                  return processBatch(
-                    connection,
-                    runId,
-                    rootPath,
-                    fileEntries,
-                    finalConfig.concurrency
-                  ).pipe(
-                    tap(processed => {
-                      stats.processed += processed;
-
-                      if (finalConfig.onProgress) {
-                        finalConfig.onProgress(stats.processed, stats.totalFiles, stats.errors);
-                      }
-                    })
-                  );
-                }),
-                // Read-priority: yield to any in-flight reads before the next hash
-                // batch, so the UI stays responsive through the long hashing phase.
-                finalConfig.betweenBatches
-                  ? switchMap((n: number) => from(finalConfig.betweenBatches!()).pipe(map(() => n)))
-                  : tap()
+                })
               );
             }),
-            finalize(() => {
-              stats.endTime = Date.now();
-              const duration = (stats.endTime - stats.startTime) / 1000;
-
-              logger.debug('Hash calculation completed', {
-                runId,
-                processed: stats.processed,
-                total: stats.totalFiles,
-                errors: stats.errors,
-                duration: `${duration.toFixed(1)}s`,
-                rate:
-                  stats.processed > 0
-                    ? `${(stats.processed / duration).toFixed(0)} files/second`
-                    : '0 files/second',
-              });
-            })
+            // Read-priority: yield to any in-flight reads before the next hash
+            // batch, so the UI stays responsive through the long hashing phase.
+            finalConfig.betweenBatches
+              ? switchMap((n: number) => from(finalConfig.betweenBatches!()).pipe(map(() => n)))
+              : tap()
           );
+        }),
+        finalize(() => {
+          stats.endTime = Date.now();
+          const duration = (stats.endTime - stats.startTime) / 1000;
+
+          logger.debug('Hash calculation completed', {
+            runId,
+            processed: stats.processed,
+            total: stats.totalFiles,
+            errors: stats.errors,
+            duration: `${duration.toFixed(1)}s`,
+            rate:
+              stats.processed > 0
+                ? `${(stats.processed / duration).toFixed(0)} files/second`
+                : '0 files/second',
+          });
         })
       );
     }),
+    // Emit once when hashing is done, not once per batch: the scanner runs duplicate
+    // detection and finalization on every emission.
+    last(null, undefined),
     map(() => void 0),
     catchError(error => {
       logger.error('Hash calculation pipeline failed', error as Error, { runId });
@@ -514,40 +513,37 @@ export function getHashingProgress(
   connection: DatabaseConnection,
   runId: string
 ): Observable<{ total: number; completed: number; remaining: number }> {
-  return findDuplicateSizes(connection, runId).pipe(
-    switchMap(duplicateSizes => {
-      if (!duplicateSizes.length) {
-        return of({ total: 0, completed: 0, remaining: 0 });
-      }
+  return defer(() => {
+    const duplicateSizes = duplicateSizesSubquery(connection, runId);
 
-      // Get total files with duplicate content_size
-      const totalQuery = connection.db
-        .select({ count: count() })
-        .from(files)
-        .where(and(eq(files.run_id, runId), inArray(files.content_size, duplicateSizes)));
+    // Get total files with duplicate content_size
+    const totalQuery = connection.db
+      .select({ count: count() })
+      .from(files)
+      .where(and(eq(files.run_id, runId), inArray(files.content_size, duplicateSizes)));
 
-      // Get completed (already hashed) files
-      const completedQuery = connection.db
-        .select({ count: count() })
-        .from(files)
-        .where(
-          and(
-            eq(files.run_id, runId),
-            inArray(files.content_size, duplicateSizes),
-            sql`hash IS NOT NULL`
-          )
-        );
-
-      return from(Promise.all([totalQuery, completedQuery])).pipe(
-        map(([totalResult, completedResult]) => {
-          const total = totalResult[0]?.count || 0;
-          const completed = completedResult[0]?.count || 0;
-          const remaining = total - completed;
-
-          return { total, completed, remaining };
-        })
+    // Get completed (already hashed) files
+    const completedQuery = connection.db
+      .select({ count: count() })
+      .from(files)
+      .where(
+        and(
+          eq(files.run_id, runId),
+          inArray(files.content_size, duplicateSizes),
+          sql`hash IS NOT NULL`
+        )
       );
-    }),
+
+    return from(Promise.all([totalQuery, completedQuery])).pipe(
+      map(([totalResult, completedResult]) => {
+        const total = totalResult[0]?.count || 0;
+        const completed = completedResult[0]?.count || 0;
+        const remaining = total - completed;
+
+        return { total, completed, remaining };
+      })
+    );
+  }).pipe(
     catchError(error => {
       logger.error('Failed to get hashing progress', error as Error, { runId });
       return of({ total: 0, completed: 0, remaining: 0 });

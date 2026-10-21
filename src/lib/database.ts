@@ -17,8 +17,17 @@ import { map, catchError, tap, switchMap } from 'rxjs/operators';
 import { gt } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import { PGlite } from '@electric-sql/pglite';
-import { pgTable, text, integer, bigint, index, primaryKey, boolean } from 'drizzle-orm/pg-core';
-import { eq, and, count, sum, inArray, isNull, isNotNull, sql } from 'drizzle-orm';
+import {
+  pgTable,
+  text,
+  integer,
+  bigint,
+  index,
+  primaryKey,
+  boolean,
+  alias,
+} from 'drizzle-orm/pg-core';
+import { eq, ne, and, count, sum, exists, inArray, isNull, isNotNull, sql } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
 import { isStandalone } from './platform-paths.ts';
 
@@ -1114,6 +1123,46 @@ export function updateFileHash(
 }
 
 /**
+ * Content sizes shared by 2+ files of a run, as a SQL subquery to pass to `inArray`.
+ * Never pass the sizes as a JS array instead: drizzle binds one parameter per element and
+ * Postgres caps a statement at 65,535 parameters, which a multi-million-file scan exceeds.
+ */
+export function duplicateSizesSubquery(connection: DatabaseConnection, runId: string) {
+  return connection.db
+    .select({ size: files.content_size })
+    .from(files)
+    .where(
+      and(
+        eq(files.run_id, runId),
+        isNotNull(files.content_size) // Only files with content_size (excludes archives/directories)
+      )
+    )
+    .groupBy(files.content_size)
+    .having(sql`count(*) > 1`);
+}
+
+/**
+ * Row-level form of {@link duplicateSizesSubquery}: true when another file of the same run
+ * shares this row's content_size. Correlated on the content_size index, so a path-ordered
+ * page stops after LIMIT rows instead of re-aggregating the whole run on every page.
+ */
+export function hasDuplicateContentSize(connection: DatabaseConnection) {
+  const other = alias(files, 'other');
+  return exists(
+    connection.db
+      .select({ one: sql`1` })
+      .from(other)
+      .where(
+        and(
+          eq(other.run_id, files.run_id),
+          eq(other.content_size, files.content_size),
+          ne(other.path, files.path)
+        )
+      )
+  );
+}
+
+/**
  * Find files with duplicate content sizes (candidates for hash calculation)
  * Uses content_size for deduplication as per specification
  */
@@ -1124,19 +1173,7 @@ export function findDuplicateSizes(
   return defer(() => {
     logger.debug('Finding duplicate content sizes', { runId });
 
-    return from(
-      connection.db
-        .select({ size: files.content_size })
-        .from(files)
-        .where(
-          and(
-            eq(files.run_id, runId),
-            isNotNull(files.content_size) // Only files with content_size (excludes archives/directories)
-          )
-        )
-        .groupBy(files.content_size)
-        .having(sql`count(*) > 1`)
-    ).pipe(
+    return from(duplicateSizesSubquery(connection, runId)).pipe(
       map(results => results.map(r => r.size!).filter(s => s !== null)), // Filter out nulls and ensure number[]
       tap(sizes => logger.debug('Found duplicate content sizes', { count: sizes.length })),
       catchError(error => {
@@ -1152,11 +1189,8 @@ export function findDuplicateSizes(
  */
 export function getFilesNeedingHash(
   connection: DatabaseConnection,
-  runId: string,
-  duplicateSizes: number[]
+  runId: string
 ): Observable<string[]> {
-  if (!duplicateSizes.length) return of([]);
-
   return defer(() => {
     return from(
       connection.db
@@ -1166,7 +1200,7 @@ export function getFilesNeedingHash(
           and(
             eq(files.run_id, runId),
             isNull(files.hash),
-            inArray(files.content_size, duplicateSizes)
+            inArray(files.content_size, duplicateSizesSubquery(connection, runId))
           )
         )
     ).pipe(

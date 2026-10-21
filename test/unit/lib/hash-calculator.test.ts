@@ -11,9 +11,9 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { promises as fs } from 'node:fs';
-import { lastValueFrom } from 'rxjs';
-import { eq } from 'drizzle-orm';
-import { performHashing } from '@lib/hash-calculator.ts';
+import { lastValueFrom, toArray } from 'rxjs';
+import { eq, sql } from 'drizzle-orm';
+import { calculateHashes, getHashingProgress, performHashing } from '@lib/hash-calculator.ts';
 import {
   createScanDatabase,
   closeScanDatabase,
@@ -227,4 +227,47 @@ describe('performHashing', () => {
     expect(calls.every(c => c.phase === 'hashing')).toBe(true);
     expect(calls[calls.length - 1].processed).toBeGreaterThan(0);
   });
+
+  it('hashes every candidate and emits once when they span several batches', async () => {
+    // Regressions: OFFSET pagination over `hash IS NULL` skipped files, because each hashed
+    // batch shrinks the result set while the offset keeps advancing; and the pipeline emitted
+    // once per batch, so the scanner re-ran duplicate detection after every batch.
+    const size = Buffer.byteLength(SAME_CONTENT);
+    const names = Array.from({ length: 7 }, (_, i) => `batch-${i}.txt`);
+    await Promise.all(names.map(n => fs.writeFile(path.join(tempDir, n), SAME_CONTENT)));
+    await lastValueFrom(
+      insertFileBatch(
+        dbCtx.db,
+        names.map(n => makeFileRow(RUN_ID, n, size, size))
+      )
+    );
+
+    const emissions = await lastValueFrom(
+      calculateHashes(dbCtx.db, RUN_ID, tempDir, { batchSize: 2 }).pipe(toArray())
+    );
+    expect(emissions).toHaveLength(1);
+
+    const rows = await dbCtx.db.db
+      .select({ path: files.path, hash: files.hash })
+      .from(files)
+      .where(eq(files.run_id, RUN_ID));
+
+    expect(rows).toHaveLength(names.length);
+    expect(rows.filter(r => r.hash === null).map(r => r.path)).toEqual([]);
+  });
+
+  it('counts candidates when there are more duplicate sizes than Postgres bind parameters', async () => {
+    // Regression: the duplicate sizes were bound one parameter each, and Postgres caps a
+    // statement at 65,535 — past that every candidate query failed and hashing was skipped.
+    const sizes = 70_000;
+    await dbCtx.db.db.execute(sql`
+      INSERT INTO files (run_id, path, physical_size, content_size, mtime, is_directory, is_hidden, is_system)
+      SELECT ${RUN_ID}, 'f' || g, (g + 1) / 2, (g + 1) / 2, 0, false, false, false
+      FROM generate_series(1, ${sizes * 2}) AS g
+    `);
+
+    const progress = await lastValueFrom(getHashingProgress(dbCtx.db, RUN_ID));
+
+    expect(progress).toEqual({ total: sizes * 2, completed: 0, remaining: sizes * 2 });
+  }, 30_000);
 });
