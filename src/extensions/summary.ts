@@ -87,7 +87,11 @@ function getFolderStats(
       .from(files)
       .where(and(eq(files.run_id, runId), eq(files.is_directory, true)));
 
-    // Get empty folders using raw SQL with NOT EXISTS
+    // Get empty folders: no row under 'folder/'. Expressed as the byte range
+    // ['folder/', 'folder0') ('0' follows '/') with the text_pattern_ops operators, so each
+    // folder is one probe of idx_files_path_pattern. A `LIKE folder || '/%'` pattern derived
+    // from a column can't use an index: it scanned every row per folder (O(folders x files),
+    // effectively unbounded on a multi-million-file scan), and read '_'/'%' in names as wildcards.
     const emptyFoldersQuery = connection.db
       .select({
         emptyFolders: sql<number>`COUNT(*)`,
@@ -100,7 +104,8 @@ function getFolderStats(
           sql`NOT EXISTS (
             SELECT 1 FROM files f2
             WHERE f2.run_id = ${runId}
-              AND f2.path LIKE ${files.path} || '/%'
+              AND f2.path ~>=~ (${files.path} || '/')
+              AND f2.path ~<~ (${files.path} || '0')
           )`
         )
       );
